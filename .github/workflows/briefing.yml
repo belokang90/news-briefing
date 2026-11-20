@@ -1,0 +1,36 @@
+name: News briefing
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check / dry-run / write"
+        type: choice
+        options: [check, dry-run, write]
+        default: check
+  push:
+    branches: [main]
+    paths: [".github/workflows/briefing.yml"]
+permissions:
+  contents: read
+concurrency:
+  group: news-briefing
+  cancel-in-progress: false
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -m py_compile briefing.py
+      - name: Run
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_PAGE_ID: ${{ secrets.NOTION_PAGE_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          MODE: ${{ inputs.mode || 'check' }}
+        run: python briefing.py --mode "$MODE"
