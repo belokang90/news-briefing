@@ -10,6 +10,9 @@ import time
 import urllib.parse as u
 import urllib.robotparser
 from zoneinfo import ZoneInfo
+from pathlib import Path
+from cryptography.fernet import Fernet
+import base64
 
 import feedparser
 import requests
@@ -33,6 +36,10 @@ FEEDS = {
     "뉴시스 국제": "https://www.newsis.com/RSS/international.xml",
     "SBS": "https://news.sbs.co.kr/news/newsflashRssFeed.do",
     "뉴시스 IT": "https://www.newsis.com/RSS/health.xml",
+    "뉴시스 산업": "https://www.newsis.com/RSS/industry.xml",
+    "뉴시스 수도권": "https://www.newsis.com/RSS/met.xml",
+    "OpenAI": "https://openai.com/news/rss.xml",
+    "Google DeepMind": "https://deepmind.google/blog/rss.xml",
 }
 QUERIES = [
     "정부 정책 국회 예산 법안 대통령 외교",
@@ -131,7 +138,8 @@ def safe_public_url(url):
         "hankyung.com", "news1.kr", "newspim.com", "seoul.co.kr", "korea.kr",
         "openai.com", "google.com", "anthropic.com", "deepseek.com", "alibabacloud.com",
         "microsoft.com", "techcrunch.com", "reuters.com", "etnews.com", "zdnet.co.kr",
-        "ittimes.com", "donga.com", "chosun.com", "joongang.co.kr"))
+        "ittimes.com", "donga.com", "chosun.com", "joongang.co.kr",
+        "deepmind.google", "news.mbc.co.kr", "lawtimes.co.kr", "inews24.com"))
 
 def public_get(url):
     for _ in range(4):
@@ -209,7 +217,7 @@ def original(candidate, start, end):
         title = article.get("headline") or meta("og:title")
         if not title or not isinstance(title, str): return None
         canonical = soup.find("link", rel="canonical")
-        real = normalize(canonical.get("href", "") if canonical else r.url)
+        real = normalize(u.urljoin(r.url, canonical.get("href", "")) if canonical else r.url)
         if not real or not safe_public_url(real): return None
         # Only use public article metadata/excerpts; do not copy full article.
         desc = article.get("description") or meta("description", "og:description")
@@ -233,7 +241,14 @@ def original(candidate, start, end):
     except Exception:
         return None
 
+AI_CALLS = 0
+MAX_AI_CALLS = 60
+
 def ai(prompt):
+    global AI_CALLS
+    if AI_CALLS >= MAX_AI_CALLS:
+        raise RuntimeError("local AI call cap")
+    AI_CALLS += 1
     key = os.environ.get("GEMINI_API_KEY", "")
     if key:
         try:
@@ -334,13 +349,40 @@ class Notion:
             time.sleep(2)
         raise RuntimeError("article not verified after write")
 
+def load_checkpoint(end):
+    path = Path(".state/pending.enc")
+    if not path.exists():
+        return []
+    try:
+        f = Fernet(base64.urlsafe_b64encode(hashlib.sha256(
+            ("briefing-checkpoint-v1:" + secret("NOTION_TOKEN")).encode()).digest()))
+        data = json.loads(f.decrypt(path.read_bytes()))
+        if data.get("date") != end.date().isoformat():
+            return []
+        return [{"url": url, "feed": "retry"} for url in data.get("pending", [])
+                if safe_public_url(url) and normalize(url)]
+    except Exception:
+        print("Checkpoint unavailable; rediscovering originals", flush=True)
+        return []
+
+def store_checkpoint(end, pending):
+    # Only encrypted original URLs, never private Notion contents or article bodies.
+    f = Fernet(base64.urlsafe_b64encode(hashlib.sha256(
+        ("briefing-checkpoint-v1:" + secret("NOTION_TOKEN")).encode()).digest()))
+    path = Path(".state/pending.enc")
+    path.parent.mkdir(exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(f.encrypt(json.dumps({"date":end.date().isoformat(),
+        "pending":sorted(set(pending))}, ensure_ascii=False).encode()))
+    tmp.replace(path)
+
 def collect(start,end):
     feeds=dict(FEEDS)
     for i,q in enumerate(QUERIES):
         feeds["search-"+str(i)]="https://news.google.com/rss/search?"+u.urlencode(
             {"q":q+" after:"+start.date().isoformat()+" before:"+(end.date()+dt.timedelta(days=1)).isoformat(),
              "hl":"ko","gl":"KR","ceid":"KR:ko"})
-    candidates={}
+    candidates={a["url"]:a for a in load_checkpoint(end)}
     failed=0
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
         for label,rows,ok in ex.map(lambda x: read_feed(*x,start,end),feeds.items()):
@@ -352,16 +394,21 @@ def collect(start,end):
       "SBS":"https://news.sbs.co.kr/news/programMain.do?broad_date="+d+"&prog_cd=R1",
       "MBC":"https://imnews.imbc.com/replay/"+str(start.year)+"/nwdesk/",
       "JTBC":"https://news.jtbc.co.kr/program/NG10000002",
-      "KBS":"https://news.kbs.co.kr/"}
+      "KBS":"https://news.kbs.co.kr/",
+      "김종훈":"https://m.ohmynews.com/NWS_Web/iRoom/articles/news_list.aspx?MEM_CD=00053216",
+      "뉴스토마토":"https://www.newstomato.com/",
+      "뉴스타파":"https://www.newstapa.org/",
+      "Anthropic":"https://www.anthropic.com/news",
+      "Google AI":"https://blog.google/technology/ai/"}
     for name,url in lists.items():
         try:
             soup=BeautifulSoup(public_get(url).content,"html.parser")
             for x in soup.find_all("a",href=True):
                 link=normalize(u.urljoin(url,x["href"]))
-                if safe_public_url(link) and re.search(r"article/|articleView|endPage|/article/NB|newsId=|CNTN_CD=",link,re.I):
+                if safe_public_url(link) and re.search(r"article/|articleView|endPage|/article/NB|newsId=|CNTN_CD=|ReadNews|/news/[^/?]+|/blog/[^/?]+",link,re.I):
                     candidates.setdefault(link,{"url":link,"title":x.get_text(" ",strip=True),"feed":name})
-            print("broadcast "+name+": list attempted; coverage unverified",flush=True)
-        except Exception: print("broadcast "+name+": unavailable",flush=True)
+            print("source "+name+": list attempted; coverage unverified",flush=True)
+        except Exception: print("source "+name+": unavailable",flush=True)
     metric("source failures",failed)
     metric("candidate total",len(candidates))
     direct=[a for a in candidates.values() if safe_public_url(a["url"]) and "news.google.com" not in a["url"]]
@@ -380,7 +427,7 @@ def collect(start,end):
             if a: verified.setdefault(a["url"],a)
     metric("verified originals",len(verified))
     metric("not verified or not attempted",len(direct)-len(verified))
-    return list(verified.values())
+    return sorted(verified.values(),key=lambda a:a["time"]), {normalize(a["url"]) for a in direct if normalize(a["url"])}
 
 def main():
     p=argparse.ArgumentParser()
@@ -398,15 +445,24 @@ def main():
     if test.get("ok") is not True: raise RuntimeError("AI authentication check failed")
     print("AI check: OK",flush=True)
     if args.mode=="check": return
-    articles=collect(start,end)
+    articles,pending=collect(start,end)
+    if args.mode=="write": store_checkpoint(end,pending)
     if not articles: raise RuntimeError("no verified originals")
     # No writes before target and source verification.
     day=notion.ensure(notion.page,day_title(end.date()),"heading_1",True) if args.mode=="write" else None
     sections={c:notion.ensure(day,c,"heading_2") for c in CATEGORIES} if day else {}
     existing={c:notion.links(x) for c,x in sections.items()}
+    if day:
+        headings=[b for b in notion.children(day) if b["type"] in ("heading_2","toggle")]
+        if [title_of(b) for b in headings] != CATEGORIES:
+            raise RuntimeError("existing date heading structure differs; refuse further writes")
     river=next(b["id"] for b in root if title_of(b)==RIVER)
     kim=next(b["id"] for b in root if title_of(b)==KIM)
     selected=saved=errors=0
+    done=set()
+    def checkpoint(a):
+        done.add(a["url"])
+        if day: store_checkpoint(end,pending-done)
     # Small batches: each validated article is saved before the next batch.
     for offset in range(0,len(articles),4):
         batch=articles[offset:offset+4]
@@ -421,7 +477,12 @@ def main():
         for b in rows:
             a=batch[b["id"]]
             cat=b.get("category")
-            if cat not in CATEGORIES and not b.get("river") and not b.get("kim"): continue
+            if cat == "제외" and not b.get("river") and not b.get("kim"):
+                checkpoint(a)
+                continue
+            if cat not in CATEGORIES and not b.get("river") and not b.get("kim"):
+                errors+=1
+                continue
             summary=b.get("summary")
             if not isinstance(summary,list) or not 1<=len(summary)<=5 or not all(isinstance(x,str) and 5<=len(x)<=450 for x in summary):
                 errors+=1
@@ -432,13 +493,23 @@ def main():
             selected+=1
             if not day: continue
             try:
+                if (b.get("river") and not river_ok) or (b.get("kim") and not kim_ok):
+                    errors+=1
+                    continue
                 if river_ok:
                     rd=dt.datetime.fromisoformat(a["time"]).date()
                     parent=notion.ensure(river,day_title(rd),"heading_2",True)
                     saved+=notion.save(parent,a,summary)
                 else:
-                    if cat not in CATEGORIES: continue
-                    saved+=notion.save(sections[cat],a,summary)
+                    if cat not in CATEGORIES:
+                        errors+=1
+                        continue
+                    if kim_ok: cat=CATEGORIES[1]
+                    already=[c for c in CATEGORIES[:-1] if a["url"] in notion.links(sections[c])]
+                    if not already:
+                        saved+=notion.save(sections[cat],a,summary)
+                    else:
+                        cat=already[0]
                     if a["exclusive"] and cat!=CATEGORIES[-1]:
                         saved+=notion.save(sections[CATEGORIES[-1]],a,summary,True)
                 if kim_ok:
@@ -449,6 +520,8 @@ def main():
                         saved+=notion.save(matches[0]["id"],a,summary)
                     else:
                         errors+=1
+                        continue
+                checkpoint(a)
             except Exception:
                 errors+=1
         metric("processed originals",min(offset+4,len(articles)))
@@ -458,6 +531,8 @@ def main():
     # This version cannot certify exhaustive coverage of all four broadcast archives.
     print("PARTIAL: broadcast/archive coverage not certified",flush=True)
     if errors: raise RuntimeError("incomplete processing")
+    if args.mode=="write":
+        raise RuntimeError("coverage not certified")
 
 if __name__=="__main__":
     try:
